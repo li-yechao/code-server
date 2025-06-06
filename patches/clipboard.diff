@@ -137,69 +137,74 @@ Index: code-server/lib/vscode/src/vs/workbench/services/clipboard/browser/clipbo
 ===================================================================
 --- code-server.orig/lib/vscode/src/vs/workbench/services/clipboard/browser/clipboardService.ts
 +++ code-server/lib/vscode/src/vs/workbench/services/clipboard/browser/clipboardService.ts
-@@ -15,19 +15,51 @@ import { IWorkbenchEnvironmentService }
+@@ -15,6 +15,10 @@ import { IWorkbenchEnvironmentService }
  import { ILogService } from '../../../../platform/log/common/log.js';
  import { ILayoutService } from '../../../../platform/layout/browser/layoutService.js';
  import { getActiveWindow } from '../../../../base/browser/dom.js';
 +import { isSafari } from '../../../../base/browser/browser.js';
-+import { IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
-+import { ICodeEditorService } from '../../../../editor/browser/services/codeEditorService.js';
++import { promiseWithResolvers, timeout } from '../../../../base/common/async.js';
++
++const READ_TEXT_FROM_SAFARI_CLIPBOARD_TIMEOUT = 200;
  
  export class BrowserClipboardService extends BaseBrowserClipboardService {
  
- 	constructor(
- 		@INotificationService private readonly notificationService: INotificationService,
-+		@IContextKeyService private readonly contextKeyService: IContextKeyService,
-+		@ICodeEditorService private readonly codeEditorService: ICodeEditorService,
- 		@IOpenerService private readonly openerService: IOpenerService,
- 		@IWorkbenchEnvironmentService private readonly environmentService: IWorkbenchEnvironmentService,
- 		@ILogService logService: ILogService,
+@@ -26,6 +30,11 @@ export class BrowserClipboardService ext
  		@ILayoutService layoutService: ILayoutService
  	) {
  		super(layoutService, logService);
 +		if (isSafari) {
-+			window.addEventListener('keydown', event => {
-+				if (this.needsPrepareClipboardContent(event)) {
-+					this.lastClipboardTextContent = navigator.clipboard.readText()
-+					this.lastCLipboardTime = Date.now();
-+				}
-+			})
++			// Webkit browsers (Safari) require a user gesture to read from the clipboard.
++			// https://webkit.org/blog/10855/async-clipboard-api/
++			window.addEventListener('keydown', () => this.resolveReadTextPromise())
 +		}
-+	}
-+
-+	private get vimMode(): string | undefined {
-+		return this.contextKeyService.getContextKeyValue('vim.mode')
  	}
  
-+	private needsPrepareClipboardContent(event: KeyboardEvent): boolean {
-+		if (event.key === 'v' && (event.ctrlKey || event.metaKey)) {
-+			return ['SearchInProgressMode', 'CommandlineInProgress'].includes(this.vimMode!)
+ 	override async writeText(text: string, type?: string): Promise<void> {
+@@ -36,6 +45,36 @@ export class BrowserClipboardService ext
+ 		return super.writeText(text, type);
+ 	}
+ 
++	private async resolveReadTextPromise() {
++		// try to wait readText request for 3 times with 20ms timeout each
++		for (let i = 0; i < 3; i++) {
++			await timeout(20);
++			const reader = this.readTextPromise
++			this.readTextPromise = undefined
++			if (reader) {
++				const text = await getActiveWindow().navigator.clipboard.readText()
++				reader.resolve(text);
++				return
++			}
 +		}
-+
-+		if (event.key.toLowerCase() === 'p' && this.codeEditorService.getActiveCodeEditor()?.hasTextFocus()) {
-+			return ['Normal', 'Visual', 'VisualBlock', 'VisualLine'].includes(this.vimMode!)
-+		}
-+
-+		return false
 +	}
 +
-+	private lastClipboardTextContent?: Promise<string>
-+	private lastCLipboardTime?: number
++	private readTextPromise?: ReturnType<typeof promiseWithResolvers<string | undefined>>
 +
- 	override async writeText(text: string, type?: string): Promise<void> {
++	private async readTextByLastUserEvent(): Promise<string | undefined> {
++		if (!this.readTextPromise) {
++			const resolvers = promiseWithResolvers<string | undefined>();
++			const timer = setTimeout(() => resolvers.resolve(undefined), READ_TEXT_FROM_SAFARI_CLIPBOARD_TIMEOUT);
++			resolvers.promise.finally(() => clearTimeout(timer))
++
++			this.readTextPromise = resolvers
++		}
++
++		const text = await this.readTextPromise.promise
++		this.readTextPromise = undefined;
++		return text
++	}
++
+ 	override async readText(type?: string): Promise<string> {
  		if (!!this.environmentService.extensionTestsLocationURI && typeof type !== 'string') {
  			type = 'vscode-tests'; // force in-memory clipboard for tests to avoid permission issues
-@@ -46,6 +78,15 @@ export class BrowserClipboardService ext
+@@ -46,6 +85,12 @@ export class BrowserClipboardService ext
  		}
  
  		try {
-+			if (isSafari && this.lastClipboardTextContent && this.lastCLipboardTime && Date.now() - this.lastCLipboardTime < 1000) {
-+				try {
-+					const content = await this.lastClipboardTextContent;
-+					if (content) return content
-+				} catch {
-+					// ignore error, we will try to read from the clipboard
-+				}
++			// Try to read clipboard text from the last user event in for webkit browsers (Safari).
++			if (isSafari) {
++				const text = await this.readTextByLastUserEvent();
++				if (text !== undefined) return text;
 +			}
 +
  			return await getActiveWindow().navigator.clipboard.readText();
